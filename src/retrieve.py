@@ -1,11 +1,15 @@
+import importlib
 from collections import Counter, defaultdict
 from typing import Dict, List
 
+import numpy as np
 import pandas as pd
 
 
 TOPK_TOTAL = 1000
 TOPK_HEURISTIC = 400
+TOPK_ALS = 200
+TOPK_BPR = 150
 TOPK_ATTR = 150
 TOPK_SEGMENT = 100
 RECENT_DAYS = [3, 7, 14]
@@ -119,6 +123,105 @@ def build_covisitation_top_items(
     return {k: [item for item, _ in v.most_common(top_n)] for k, v in coocc.items()}
 
 
+def train_implicit_models(
+    train_data: pd.DataFrame,
+    factors: int = 256,
+    regularization: float = 0.05,
+    als_iterations: int = 30,
+    bpr_iterations: int = 50,
+    use_gpu: bool = True,
+):
+    implicit = importlib.import_module('implicit')
+    from scipy import sparse
+
+    df_imp = train_data.copy()
+    df_imp['customer_id_cat'] = df_imp['customer_id'].astype('category')
+    df_imp['article_id_cat'] = df_imp['article_id'].astype('category')
+
+    user_map = dict(enumerate(df_imp['customer_id_cat'].cat.categories))
+    item_map = dict(enumerate(df_imp['article_id_cat'].cat.categories))
+    rev_user_map = {v: k for k, v in user_map.items()}
+
+    row = df_imp['customer_id_cat'].cat.codes.values
+    col = df_imp['article_id_cat'].cat.codes.values
+
+    max_date = df_imp['t_dat'].max()
+    days_diff = (max_date - df_imp['t_dat']).dt.days.values
+    decay_weights = np.exp(-days_diff / 180.0)
+
+    if use_gpu:
+        try:
+            import torch
+            use_gpu = torch.cuda.is_available()
+        except Exception:
+            use_gpu = False
+
+    user_item_matrix = sparse.csr_matrix(
+        (decay_weights, (row, col)),
+        shape=(len(user_map), len(item_map)),
+    )
+
+    als_model = implicit.als.AlternatingLeastSquares(
+        factors=factors,
+        regularization=regularization,
+        iterations=als_iterations,
+        random_state=42,
+        use_gpu=use_gpu,
+    )
+    als_model.fit(user_item_matrix)
+
+    bpr_model = implicit.bpr.BayesianPersonalizedRanking(
+        factors=factors,
+        learning_rate=0.05,
+        regularization=0.01,
+        iterations=bpr_iterations,
+        random_state=42,
+        use_gpu=use_gpu,
+    )
+    bpr_model.fit(user_item_matrix)
+
+    return als_model, bpr_model, user_item_matrix, rev_user_map, item_map
+
+
+def build_implicit_recommendations(
+    als_model,
+    bpr_model,
+    user_item_matrix,
+    rev_user_map: Dict[str, int],
+    item_map: Dict[int, str],
+    target_users: List[str],
+    topk_als: int = TOPK_ALS,
+    topk_bpr: int = TOPK_BPR,
+):
+    als_preds: Dict[str, List[str]] = {}
+    bpr_preds: Dict[str, List[str]] = {}
+    imp_ids = [rev_user_map.get(user, -1) for user in target_users]
+    valid_pairs = [(pos, uid) for pos, uid in enumerate(imp_ids) if uid != -1]
+    if not valid_pairs:
+        return als_preds, bpr_preds
+
+    valid_positions, valid_uids = zip(*valid_pairs)
+    ids_als, _ = als_model.recommend(
+        valid_uids,
+        user_item_matrix[list(valid_uids)],
+        N=topk_als,
+        filter_already_liked_items=False,
+    )
+    ids_bpr, _ = bpr_model.recommend(
+        valid_uids,
+        user_item_matrix[list(valid_uids)],
+        N=topk_bpr,
+        filter_already_liked_items=False,
+    )
+
+    for batch_idx, uid in enumerate(valid_uids):
+        customer_id = target_users[valid_positions[batch_idx]]
+        als_preds[customer_id] = [item_map[item_idx] for item_idx in ids_als[batch_idx]]
+        bpr_preds[customer_id] = [item_map[item_idx] for item_idx in ids_bpr[batch_idx]]
+
+    return als_preds, bpr_preds
+
+
 def generate_candidates_for_user(
     customer_id: str,
     transactions: pd.DataFrame,
@@ -127,6 +230,8 @@ def generate_candidates_for_user(
     attr_top_items: Dict[str, List[str]],
     article_attr_key: Dict[str, str],
     coocc_top: Dict[str, List[str]],
+    als_preds: Dict[str, List[str]],
+    bpr_preds: Dict[str, List[str]],
     popular_all: List[str],
     pop_rank: Dict[str, int],
     top_k: int = TOPK_TOTAL,
@@ -191,12 +296,50 @@ def generate_candidates_for_user(
                     'article_id': item_id,
                     'candidate_score': float(score),
                     'is_covisitation': int(item_id in covis_set),
+                    'is_als': 0,
+                    'is_bpr': 0,
                     'is_attr': 0,
                     'is_segment': 0,
                 }
             )
             seen.add(item_id)
             if len(out_features) == TOPK_HEURISTIC:
+                break
+
+    for item_id in als_preds.get(customer_id, []):
+        if item_id not in seen:
+            out_features.append(
+                {
+                    'customer_id': customer_id,
+                    'article_id': item_id,
+                    'candidate_score': 0.0,
+                    'is_covisitation': 0,
+                    'is_als': 1,
+                    'is_bpr': 0,
+                    'is_attr': 0,
+                    'is_segment': 0,
+                }
+            )
+            seen.add(item_id)
+            if len(out_features) == TOPK_HEURISTIC + TOPK_ALS:
+                break
+
+    for item_id in bpr_preds.get(customer_id, []):
+        if item_id not in seen:
+            out_features.append(
+                {
+                    'customer_id': customer_id,
+                    'article_id': item_id,
+                    'candidate_score': 0.0,
+                    'is_covisitation': 0,
+                    'is_als': 0,
+                    'is_bpr': 1,
+                    'is_attr': 0,
+                    'is_segment': 0,
+                }
+            )
+            seen.add(item_id)
+            if len(out_features) == TOPK_HEURISTIC + TOPK_ALS + TOPK_BPR:
                 break
 
     for item_id in attr_cands:
@@ -207,12 +350,14 @@ def generate_candidates_for_user(
                     'article_id': item_id,
                     'candidate_score': 0.0,
                     'is_covisitation': 0,
+                    'is_als': 0,
+                    'is_bpr': 0,
                     'is_attr': 1,
                     'is_segment': 0,
                 }
             )
             seen.add(item_id)
-            if len(out_features) == TOPK_HEURISTIC + TOPK_ATTR:
+            if len(out_features) == TOPK_HEURISTIC + TOPK_ALS + TOPK_BPR + TOPK_ATTR:
                 break
 
     for item_id in seg_cands:
@@ -223,12 +368,14 @@ def generate_candidates_for_user(
                     'article_id': item_id,
                     'candidate_score': 0.0,
                     'is_covisitation': 0,
+                    'is_als': 0,
+                    'is_bpr': 0,
                     'is_attr': 0,
                     'is_segment': 1,
                 }
             )
             seen.add(item_id)
-            if len(out_features) == TOPK_HEURISTIC + TOPK_ATTR + TOPK_SEGMENT:
+            if len(out_features) == TOPK_HEURISTIC + TOPK_ALS + TOPK_BPR + TOPK_ATTR + TOPK_SEGMENT:
                 break
 
     for item_id in popular_all:
@@ -239,6 +386,8 @@ def generate_candidates_for_user(
                     'article_id': item_id,
                     'candidate_score': 0.0,
                     'is_covisitation': 0,
+                    'is_als': 0,
+                    'is_bpr': 0,
                     'is_attr': 0,
                     'is_segment': 0,
                 }
@@ -258,6 +407,7 @@ def generate_candidates_batch(
     transactions: pd.DataFrame,
     articles: pd.DataFrame,
     top_k: int = TOPK_TOTAL,
+    use_implicit: bool = True,
 ) -> pd.DataFrame:
     customers = _normalize_ids(customers)
     transactions = _normalize_ids(transactions)
@@ -277,6 +427,22 @@ def generate_candidates_batch(
     }
     coocc_top = build_covisitation_top_items(transactions)
 
+    als_preds: Dict[str, List[str]] = {}
+    bpr_preds: Dict[str, List[str]] = {}
+    if use_implicit:
+        try:
+            als_model, bpr_model, user_item_matrix, rev_user_map, item_map = train_implicit_models(transactions)
+            als_preds, bpr_preds = build_implicit_recommendations(
+                als_model=als_model,
+                bpr_model=bpr_model,
+                user_item_matrix=user_item_matrix,
+                rev_user_map=rev_user_map,
+                item_map=item_map,
+                target_users=customers['customer_id'].astype(str).tolist(),
+            )
+        except ImportError:
+            pass
+
     rows = []
     for customer_id in customers['customer_id'].astype(str).tolist():
         rows.extend(
@@ -288,6 +454,8 @@ def generate_candidates_batch(
                 attr_top_items=attr_top_items,
                 article_attr_key=article_attr_key,
                 coocc_top=coocc_top,
+                als_preds=als_preds,
+                bpr_preds=bpr_preds,
                 popular_all=popular_all,
                 pop_rank=pop_rank,
                 top_k=top_k,
@@ -300,6 +468,8 @@ def generate_candidates_batch(
         'candidate_rank',
         'candidate_score',
         'is_covisitation',
+        'is_als',
+        'is_bpr',
         'is_attr',
         'is_segment',
     ])
